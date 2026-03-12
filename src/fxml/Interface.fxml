@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?import javafx.scene.layout.AnchorPane?>
+<?import javafx.scene.layout.Pane?>
+<?import ui.InventoryBar?>
+<?import ui.MoneyUI?>
+
+<?import ui.ShopOverlay?>
+<?import ui.ShopButton?>
+<AnchorPane prefHeight="400.0" prefWidth="600.0"
+            xmlns="http://javafx.com/javafx/25"
+            xmlns:fx="http://javafx.com/fxml/1"
+            fx:controller="FarmController">
+    <children>
+        <Pane fx:id="farmContainer"
+              AnchorPane.topAnchor="0"
+              AnchorPane.bottomAnchor="0"
+              AnchorPane.leftAnchor="0"
+              AnchorPane.rightAnchor="0"/>
+
+
+        <MoneyUI fx:id="moneyUI"
+                 AnchorPane.topAnchor="10.0"
+                 AnchorPane.rightAnchor="10.0"/>
+
+        <InventoryBar fx:id="inventoryBar"
+                      AnchorPane.bottomAnchor="-80"
+                      AnchorPane.leftAnchor="0"
+                      AnchorPane.rightAnchor="0"/>
+
+        <ShopOverlay fx:id="shopOverlay"
+                     AnchorPane.topAnchor="0" AnchorPane.bottomAnchor="0"
+                     AnchorPane.leftAnchor="0" AnchorPane.rightAnchor="0"/>
+
+        <ShopButton fx:id="shopButton"
+                    AnchorPane.topAnchor="10.0"
+                    AnchorPane.leftAnchor="10.0"/>
+    </children>
+</AnchorPane>
