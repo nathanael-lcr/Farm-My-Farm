@@ -7,6 +7,8 @@ public class Soil {
     public int type;
 
     private boolean isField = false;
+    private boolean owned = false;       // La parcelle appartient-elle au joueur ?
+    private int purchasePrice = 100;     // Prix d'achat de la parcelle
 
     public Soil(Crop crop, int type) {
         this.crop = crop;
@@ -23,6 +25,22 @@ public class Soil {
 
     public void setField(boolean isField) {
         this.isField = isField;
+    }
+
+    public boolean isOwned() {
+        return owned;
+    }
+
+    public void setOwned(boolean owned) {
+        this.owned = owned;
+    }
+
+    public int getPurchasePrice() {
+        return purchasePrice;
+    }
+
+    public void setPurchasePrice(int price) {
+        this.purchasePrice = price;
     }
 
     public StringProperty getDisplayProperty() {

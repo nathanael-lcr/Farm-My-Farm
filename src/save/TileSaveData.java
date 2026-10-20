@@ -8,5 +8,6 @@ public class TileSaveData implements Serializable {
     public boolean isField;
     public boolean hasCrop;
     public String cropType;
+    public boolean isOwned;
     public double growthTimer;
 }

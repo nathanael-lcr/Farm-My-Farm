@@ -24,12 +24,20 @@ public class InventoryBar extends VBox {
                     "-fx-background-color: transparent;" +
                     "-fx-cursor: hand;";
 
+    private static final String SLOT_STYLE_SELECTED =
+            "-fx-background-image: url('/assets/button_square.png');" +
+                    "-fx-background-size: stretch;" +
+                    "-fx-background-repeat: no-repeat;" +
+                    "-fx-background-color: transparent;" +
+                    "-fx-effect: dropshadow(three-pass-box, #ffecc0, 14, 0.8, 0, 0);" +
+                    "-fx-cursor: hand;";
+
     private static final String SLOT_STYLE_HOVER =
             "-fx-background-image: url('/assets/button_square.png');" +
                     "-fx-background-size: stretch;" +
                     "-fx-background-repeat: no-repeat;" +
                     "-fx-background-color: transparent;" +
-                    "-fx-effect: dropshadow(three-pass-box, #ffecc0, 10, 0.5, 0, 0);" + // Petit effet de brillance au survol au lieu de changer le texte !
+                    "-fx-effect: dropshadow(three-pass-box, #ffecc0, 10, 0.5, 0, 0);" +
                     "-fx-cursor: hand;";
 
     private boolean open = false;
@@ -37,6 +45,7 @@ public class InventoryBar extends VBox {
     private HBox slotsRow;
 
     private ItemSelectHandler selectHandler;
+    private String selectedKey = null;  // clé de l'item actuellement sélectionné
 
     public interface ItemSelectHandler {
         void onSelect(String item);
@@ -83,20 +92,22 @@ public class InventoryBar extends VBox {
         Button slot = new Button();
         slot.setId(key);
         slot.setPrefSize(90, 85);
-
         slot.setStyle(SLOT_STYLE_NORMAL);
-        slot.setOnMouseEntered(e -> slot.setStyle(SLOT_STYLE_HOVER));
-        slot.setOnMouseExited(e -> slot.setStyle(SLOT_STYLE_NORMAL));
+
+        slot.setOnMouseEntered(e -> {
+            if (!key.equals(selectedKey)) slot.setStyle(SLOT_STYLE_HOVER);
+        });
+        slot.setOnMouseExited(e -> {
+            if (!key.equals(selectedKey)) slot.setStyle(SLOT_STYLE_NORMAL);
+        });
 
         if (iconPath != null && !iconPath.isEmpty()) {
             try {
                 Image img = new Image(getClass().getResourceAsStream(iconPath));
                 ImageView icon = new ImageView(img);
-
                 icon.setFitWidth(70);
                 icon.setFitHeight(70);
                 icon.setPreserveRatio(true);
-
                 slot.setGraphic(icon);
                 slot.setContentDisplay(ContentDisplay.GRAPHIC_ONLY);
             } catch (Exception e) {
@@ -107,14 +118,37 @@ public class InventoryBar extends VBox {
         Tooltip tooltip = new Tooltip(label + "\n" + tooltipText);
         tooltip.setStyle("-fx-font-size: 14; -fx-font-weight: bold;");
         slot.setTooltip(tooltip);
-
         slot.getProperties().put("baseDesc", tooltipText);
 
         slot.setOnAction(e -> {
-            if (selectHandler != null) selectHandler.onSelect(key);
+            selectItem(key);  // sélection visuelle + callback
         });
 
         slotsRow.getChildren().add(slot);
+    }
+
+    /**
+     * Sélectionne programmatiquement un item par sa clé,
+     * met à jour le style et déclenche le handler.
+     */
+    public void selectItem(String key) {
+        // Réinitialise le style de l'ancien item sélectionné
+        if (selectedKey != null) {
+            slotsRow.getChildren().stream()
+                    .filter(n -> selectedKey.equals(n.getId()))
+                    .findFirst()
+                    .ifPresent(n -> ((Button) n).setStyle(SLOT_STYLE_NORMAL));
+        }
+
+        selectedKey = key;
+
+        // Applique le style "sélectionné" au nouveau bouton
+        slotsRow.getChildren().stream()
+                .filter(n -> key.equals(n.getId()))
+                .findFirst()
+                .ifPresent(n -> ((Button) n).setStyle(SLOT_STYLE_SELECTED));
+
+        if (selectHandler != null) selectHandler.onSelect(key);
     }
 
     public void updateItem(String key, String newLabel) {
@@ -134,16 +168,15 @@ public class InventoryBar extends VBox {
     }
 
     public void removeItem(String key) {
+        if (key.equals(selectedKey)) selectedKey = null;
         slotsRow.getChildren().removeIf(node -> key.equals(node.getId()));
     }
 
     public void toggle() {
         open = !open;
-
         double distanceToSlide = BAR_HEIGHT + 30;
 
         TranslateTransition slide = new TranslateTransition(Duration.millis(ANIM_MS), this);
-
         slide.setToY(open ? -distanceToSlide : 20);
 
         RotateTransition rotate = new RotateTransition(Duration.millis(ANIM_MS), toggleButton);
@@ -154,9 +187,18 @@ public class InventoryBar extends VBox {
     }
 
     public void clearAll() {
+        if (selectedKey != null &&
+                !selectedKey.equals("Récolte") &&
+                !selectedKey.equals("Champ") &&
+                !selectedKey.equals("Achat terrain")) {
+            selectedKey = null;
+        }
         slotsRow.getChildren().removeIf(node -> {
             String id = node.getId();
-            return id != null && !id.equals("Récolte") && !id.equals("Champ");
+            return id != null
+                    && !id.equals("Récolte")
+                    && !id.equals("Champ")
+                    && !id.equals("Achat terrain");
         });
     }
 

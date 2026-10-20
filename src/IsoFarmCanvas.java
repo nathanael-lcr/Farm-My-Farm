@@ -1,127 +1,103 @@
+import javafx.application.Platform;
 import javafx.scene.Cursor;
 import javafx.scene.SnapshotParameters;
 import javafx.scene.canvas.Canvas;
 import javafx.scene.canvas.GraphicsContext;
 import javafx.scene.image.Image;
+import javafx.scene.input.MouseButton;
 import javafx.scene.paint.Color;
 import javafx.scene.text.Font;
 import javafx.scene.text.TextAlignment;
 import javafx.scene.transform.Affine;
 
-import java.util.HashMap;
-import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class IsoFarmCanvas extends Canvas {
 
-    private double tileW() {
-        return getWidth() / (size + 1.5);
-    }
+    // ─── Caméra — FX thread uniquement ───────────────────────────────────────
+    private double camX = 0, camY = 0, zoom = 1.0;
 
-    private double tileH() {
-        return tileW() / 2.0;
-    }
+    private static final double ZOOM_MIN    = 0.6;   // limite dézoom pour garder les perfs
+    private static final double ZOOM_MAX    = 2.5;
+    private static final double BASE_TILE_W = 80.0;
 
-    private double offsetX() {
-        return getWidth() / 2.0;
-    }
+    // Pan (molette enfoncée = bouton du milieu)
+    private boolean panActive = false;
+    private double  panStartX, panStartY, panCamX0, panCamY0;
 
-    private double offsetY() {
-        return (getHeight() - (size * tileH())) / 2.0 + tileH();
-    }
+    // Drag action tuile (clic gauche maintenu)
+    private boolean tileActionActive = false;
+    private int     lastDragRow = -1, lastDragCol = -1;
 
-    private final int size;
+    private double tileW()   { return BASE_TILE_W * zoom; }
+    private double tileH()   { return tileW() / 2.0; }
+    private double originX() { return getWidth()  / 2.0 + camX; }
+    private double originY() { return getHeight() / 4.0 + camY; }
+
+    // ─── Grille ───────────────────────────────────────────────────────────────
+    private final int      size;
     private final Soil[][] farm;
-    private static final Color HOVER_FREE = Color.web("#ffffff", 0.25);
-    private static final Color HOVER_READY = Color.web("#f5c842", 0.7);
-    private static final Color HOVER_GROWING = Color.web("#8b5e3c", 0.7);
-    private static final Color GROWING_SHADOW = Color.web("#000000", 0.05);
-    private static final Color STROKE_HOVER = Color.web("#ffffff", 0.7);
-    private static final Color STROKE_NORMAL = Color.web("#000000", 0.3);
-    private int hoverRow = -1;
-    private int hoverCol = -1;
-    private int lastDragRow = -1;
-    private int lastDragCol = -1;
 
-    private TileClickHandler clickHandler;
-    private boolean isDragging;
+    // ─── Pipeline double-buffer ───────────────────────────────────────────────
+    private final AtomicReference<List<RenderCommand>> readyFrame = new AtomicReference<>(null);
+    private final AtomicBoolean dirtyFlag  = new AtomicBoolean(true);
+    private final AtomicBoolean workerBusy = new AtomicBoolean(false);
 
-    private Image[] cachedSoilTiles = new Image[6];
+    private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "iso-worker");
+        t.setDaemon(true);
+        return t;
+    });
 
-    private double cachedTileW = -1;
+    // ─── Cache sol — FX thread uniquement ────────────────────────────────────
+    private final Image[] soilCache   = new Image[6];
+    private double        soilCacheTW = -1;
 
-    private void buildCachedSoilTiles() {
-        double w = tileW();
-        double h = tileH();
+    // ─── Hover — FX thread uniquement ────────────────────────────────────────
+    private int hoverRow = -1, hoverCol = -1;
 
-        if (cachedSoilTiles[0] != null && cachedTileW == w) return;
-        cachedTileW = w;
+    // ─── Couleurs ─────────────────────────────────────────────────────────────
+    private static final Color BG             = Color.web("#5c8a3f");
+    private static final Color HOVER_FREE     = Color.web("#ffffff", 0.25);
+    private static final Color HOVER_BUYABLE  = Color.web("#f5e642", 0.55);
+    private static final Color HOVER_READY    = Color.web("#f5c842", 0.70);
+    private static final Color HOVER_GROWING  = Color.web("#8b5e3c", 0.70);
+    private static final Color GROW_SHADOW    = Color.web("#000000", 0.05);
+    private static final Color UNOWNED_TINT   = Color.web("#000000", 0.40);
+    private static final Color STROKE_NORMAL  = Color.web("#000000", 0.30);
+    private static final Color STROKE_HOVER   = Color.web("#ffffff", 0.70);
+    private static final Color STROKE_UNOWNED = Color.web("#ff4444", 0.60);
 
-        for (int i = 0; i < 6; i++) {
-            Canvas tmp = new Canvas(w, h);
-            GraphicsContext g = tmp.getGraphicsContext2D();
+    // ─── Callbacks ────────────────────────────────────────────────────────────
+    public interface TileClickHandler   { void onClick(int row, int col, boolean isFirstClick); }
+    public interface AnimalClickHandler { void onInteract(Animal animal, double sx, double sy); }
 
-            double cx = w / 2, cy = h / 2, hw = w / 2, hh = h / 2;
-
-            g.beginPath();
-            g.moveTo(cx, cy - hh);
-            g.lineTo(cx + hw, cy);
-            g.lineTo(cx, cy + hh);
-            g.lineTo(cx - hw, cy);
-            g.closePath();
-            g.clip();
-
-            if (SOIL_TEXTURES[i] != null && !SOIL_TEXTURES[i].isError()) {
-                double W = SOIL_TEXTURES[i].getWidth();
-                double H = SOIL_TEXTURES[i].getHeight();
-                Affine affine = new Affine(hw / W, hw / H, 0, -hh / W, hh / H, cy);
-                g.setTransform(affine);
-                g.drawImage(SOIL_TEXTURES[i], 0, 0, W, H);
-            }
-
-            // retirer le fond pour éviter les bords blancs dégueulasses
-            SnapshotParameters params = new SnapshotParameters();
-            params.setFill(Color.TRANSPARENT);
-
-            cachedSoilTiles[i] = tmp.snapshot(params, null);
-        }
-    }
-
-    public interface TileClickHandler {
-        void onClick(int row, int col, boolean isFirstClick);
-    }
-    public interface AnimalClickHandler {
-        void onInteract(Animal animal, double screenX, double screenY);
-    }
-
+    private TileClickHandler   tileClickHandler;
     private AnimalClickHandler animalClickHandler;
 
-    public void setOnAnimalClick(AnimalClickHandler handler) {
-        this.animalClickHandler = handler;
-    }
+    /**
+     * NE PAS utiliser setOnTileClick depuis l'extérieur.
+     * Utiliser registerTileClickHandler / registerAnimalClickHandler
+     * pour ne pas écraser les handlers internes du canvas.
+     */
+    public void registerTileClickHandler(TileClickHandler h)   { this.tileClickHandler = h; }
+    public void registerAnimalClickHandler(AnimalClickHandler h){ this.animalClickHandler = h; }
 
+    // Alias pour compatibilité avec le code existant
+    public void setOnTileClick(TileClickHandler h)     { registerTileClickHandler(h); }
+    public void setOnAnimalClick(AnimalClickHandler h) { registerAnimalClickHandler(h); }
+
+    // ─── Sprites ──────────────────────────────────────────────────────────────
     private static final Image[] SOIL_TEXTURES = new Image[6];
-
-    private static class CropSprites {
-        Image growing;
-        Image ready;
-
-        CropSprites(Image growing, Image ready) {
-            this.growing = growing;
-            this.ready = ready;
-        }
-    }
-
-    private static final Map<String, CropSprites> CROP_SPRITES_MAP = new HashMap<>();
-    private static Image ANIMAL_SPRITE;
-    private static Image BUBBLE_HUNGRY;
-    private static Image BUBBLE_READY;
-
-    private java.util.List<Animal> animals;
-
-    public void setAnimals(java.util.List<Animal> animals) {
-        this.animals = animals;
-    }
+    private static class CropSprites { Image growing, ready; CropSprites(Image g,Image r){growing=g;ready=r;} }
+    private static final java.util.Map<String,CropSprites> CROP_SPRITES_MAP = new java.util.HashMap<>();
+    private static Image ANIMAL_SPRITE, BUBBLE_HUNGRY, BUBBLE_READY;
 
     static {
         try {
@@ -131,344 +107,419 @@ public class IsoFarmCanvas extends Canvas {
             SOIL_TEXTURES[3] = new Image(IsoFarmCanvas.class.getResourceAsStream("/assets/field.png"));
             SOIL_TEXTURES[4] = new Image(IsoFarmCanvas.class.getResourceAsStream("/assets/field2.png"));
             SOIL_TEXTURES[5] = new Image(IsoFarmCanvas.class.getResourceAsStream("/assets/field3.png"));
-            ANIMAL_SPRITE = new Image(IsoFarmCanvas.class.getResourceAsStream("/assets/rooster.png"));
-            BUBBLE_HUNGRY = new Image(IsoFarmCanvas.class.getResourceAsStream("/assets/bubble.png"));
-            BUBBLE_READY = new Image(IsoFarmCanvas.class.getResourceAsStream("/assets/money.png"));
-            System.out.println("pas de souci avec les textures");
-        } catch (Exception e) {
-            System.err.println("oh oh pas de textures trouvées");
-        }
-        loadCropSprites("Sativa", "/assets/plant.png", "/assets/plant2.png");
+            ANIMAL_SPRITE  = new Image(IsoFarmCanvas.class.getResourceAsStream("/assets/rooster.png"));
+            BUBBLE_HUNGRY  = new Image(IsoFarmCanvas.class.getResourceAsStream("/assets/bubble.png"));
+            BUBBLE_READY   = new Image(IsoFarmCanvas.class.getResourceAsStream("/assets/money.png"));
+        } catch (Exception e) { System.err.println("Textures manquantes"); }
+        loadCropSprites("Sativa",      "/assets/plant.png",  "/assets/plant2.png");
         loadCropSprites("Purple Haze", "/assets/purple.png", "/assets/purple2.png");
-        loadCropSprites("Blue Haze", "/assets/blue.png", "/assets/blue2.png");
+        loadCropSprites("Blue Haze",   "/assets/blue.png",   "/assets/blue2.png");
+    }
+    private static void loadCropSprites(String n, String g, String r) {
+        try { CROP_SPRITES_MAP.put(n, new CropSprites(
+                new Image(IsoFarmCanvas.class.getResourceAsStream(g)),
+                new Image(IsoFarmCanvas.class.getResourceAsStream(r))));
+        } catch (Exception e) { System.err.println("Sprites manquants : " + n); }
     }
 
-    private static void loadCropSprites(String cropName, String growingPath, String readyPath) {
-        try {
-            Image growing = new Image(IsoFarmCanvas.class.getResourceAsStream(growingPath));
-            Image ready = new Image(IsoFarmCanvas.class.getResourceAsStream(readyPath));
-            CROP_SPRITES_MAP.put(cropName, new CropSprites(growing, ready));
-            System.out.println("Sprites chargés pour : " + cropName);
-        } catch (Exception e) {
-            System.err.println("Sprites introuvables pour : " + cropName + " (vérifiez les chemins)");
-        }
+    // ─── Animaux ──────────────────────────────────────────────────────────────
+    private record AnimalSnapshot(double row, double col, boolean facingRight,
+                                  boolean hungry, boolean hasProduct) {}
+    private List<AnimalSnapshot> animalSnapshots = List.of();
+    private List<Animal>         animalList       = new ArrayList<>();
+
+    public void setAnimals(List<Animal> animals) {
+        animalList = animals;
+        List<AnimalSnapshot> snaps = new ArrayList<>(animals.size());
+        for (Animal a : animals)
+            snaps.add(new AnimalSnapshot(a.getRow(), a.getCol(),
+                    a.isFacingRight(), a.isHungry(), a.hasProduct()));
+        animalSnapshots = snaps;
+        markDirty();
     }
 
+    // ─── Constructeur ─────────────────────────────────────────────────────────
     public IsoFarmCanvas(int size, Soil[][] farm) {
-        super(600, 400);
+        super(800, 600);
         this.size = size;
         this.farm = farm;
+        centreCamera();
 
-        widthProperty().addListener((obs, oldVal, newVal) -> redraw());
-        heightProperty().addListener((obs, oldVal, newVal) -> redraw());
+        widthProperty().addListener((o,ov,nv)  -> { rebuildSoilCache(); markDirty(); });
+        heightProperty().addListener((o,ov,nv) -> markDirty());
 
+        // ── Zoom centré sur le curseur ─────────────────────────────────────
+        setOnScroll(e -> {
+            double mx = e.getX(), my = e.getY();
+            double factor  = e.getDeltaY() > 0 ? 1.1 : 1.0 / 1.1;
+            double newZoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, zoom * factor));
+            if (newZoom == zoom) return;
+            double ratio = newZoom / zoom;
+            camX = mx - getWidth()/2.0  - ratio * (mx - getWidth()/2.0  - camX);
+            camY = my - getHeight()/4.0 - ratio * (my - getHeight()/4.0 - camY);
+            zoom = newZoom;
+            rebuildSoilCache();
+            markDirty();
+        });
+
+        // ── Mouse pressed ─────────────────────────────────────────────────
         setOnMousePressed(e -> {
-            Animal clickedAnimal = getAnimalAt(e.getX(), e.getY());
-
-            if (clickedAnimal != null) {
-                if (animalClickHandler != null) {
-                    animalClickHandler.onInteract(clickedAnimal, e.getX(), e.getY());
-                }
-            } else {
-                int[] cell = pickTile(e.getX(), e.getY());
-                if (cell != null && clickHandler != null) {
-                    lastDragRow = cell[0];
-                    lastDragCol = cell[1];
-                    clickHandler.onClick(cell[0], cell[1], true);
-                }
+            // ── BOUTON DU MILIEU → pan ──
+            // On teste e.getButton() == MIDDLE, pas isMiddleButtonDown()
+            // car au moment du PRESSED l'état "down" n'est pas encore propagé
+            if (e.getButton() == MouseButton.MIDDLE) {
+                panActive = true;
+                panStartX = e.getX(); panStartY = e.getY();
+                panCamX0  = camX;     panCamY0  = camY;
+                setCursor(Cursor.MOVE);
+                return;
             }
-        });
 
-        setOnMouseDragged(e -> {
+            // ── BOUTON GAUCHE → jeu ──
+            if (e.getButton() != MouseButton.PRIMARY) return;
+
+            // Animal en priorité
+            int[] ac = pickAnimalTile(e.getX(), e.getY());
+            if (ac != null) {
+                for (Animal a : animalList)
+                    if ((int)a.getRow() == ac[0] && (int)a.getCol() == ac[1]) {
+                        if (animalClickHandler != null)
+                            animalClickHandler.onInteract(a, e.getX(), e.getY());
+                        break;
+                    }
+                return;
+            }
+
+            // Tuile
             int[] cell = pickTile(e.getX(), e.getY());
-            if (cell != null && clickHandler != null) {
-                if (cell[0] != lastDragRow || cell[1] != lastDragCol) {
+            if (cell != null && tileClickHandler != null) {
+                tileActionActive = true;
+                lastDragRow = cell[0];
+                lastDragCol = cell[1];
+                tileClickHandler.onClick(cell[0], cell[1], true);
+            }
+        });
+
+        // ── Mouse dragged ─────────────────────────────────────────────────
+        setOnMouseDragged(e -> {
+            // Pan (molette maintenue)
+            if (panActive) {
+                camX = panCamX0 + (e.getX() - panStartX);
+                camY = panCamY0 + (e.getY() - panStartY);
+                markDirty();
+                return;
+            }
+
+            // Action sur tuiles (gauche maintenu)
+            if (tileActionActive && tileClickHandler != null) {
+                int[] cell = pickTile(e.getX(), e.getY());
+                if (cell != null && (cell[0] != lastDragRow || cell[1] != lastDragCol)) {
                     lastDragRow = cell[0];
                     lastDragCol = cell[1];
-                    clickHandler.onClick(cell[0], cell[1], false);
+                    tileClickHandler.onClick(cell[0], cell[1], false);
                 }
             }
         });
 
+        // ── Mouse released ────────────────────────────────────────────────
         setOnMouseReleased(e -> {
-            lastDragRow = -1;
-            lastDragCol = -1;
+            if (e.getButton() == MouseButton.MIDDLE) {
+                panActive = false;
+                setCursor(Cursor.DEFAULT);
+            }
+            if (e.getButton() == MouseButton.PRIMARY) {
+                tileActionActive = false;
+                lastDragRow = -1;
+                lastDragCol = -1;
+            }
         });
 
+        // ── Mouse moved (hover) ───────────────────────────────────────────
         setOnMouseMoved(e -> {
-            Animal hoveredAnimal = getAnimalAt(e.getX(), e.getY());
-
-            if (hoveredAnimal != null) {
-                setCursor(Cursor.HAND); // On met la petite main !
-
-                if (hoverRow != -1 || hoverCol != -1) {
-                    hoverRow = -1;
-                    hoverCol = -1;
-                    redraw();
-                }
+            if (pickAnimalTile(e.getX(), e.getY()) != null) {
+                setCursor(Cursor.HAND);
+                setHover(-1, -1);
             } else {
                 setCursor(Cursor.DEFAULT);
                 int[] cell = pickTile(e.getX(), e.getY());
-                int newRow = cell != null ? cell[0] : -1;
-                int newCol = cell != null ? cell[1] : -1;
-
-                if (newRow != hoverRow || newCol != hoverCol) {
-                    hoverRow = newRow;
-                    hoverCol = newCol;
-                    redraw();
-                }
+                setHover(cell != null ? cell[0] : -1,
+                        cell != null ? cell[1] : -1);
             }
         });
 
-        setOnMouseExited(e -> {
-            setCursor(Cursor.DEFAULT);
-            hoverRow = -1;
-            hoverCol = -1;
-            redraw();
-        });
+        setOnMouseExited(e -> { setCursor(Cursor.DEFAULT); setHover(-1, -1); });
     }
 
-    public void setOnTileClick(TileClickHandler handler) {
-        this.clickHandler = handler;
+    // ─── Cache sol ────────────────────────────────────────────────────────────
+    private void rebuildSoilCache() {
+        double tw = tileW(), th = tw / 2.0;
+        if (Math.abs(tw - soilCacheTW) < 1.0) return;
+        soilCacheTW = tw;
+        for (int i = 0; i < 6; i++) {
+            Canvas tmp = new Canvas(tw, th);
+            GraphicsContext g = tmp.getGraphicsContext2D();
+            double cx=tw/2, cy=th/2, hw=tw/2, hh=th/2;
+            g.beginPath();
+            g.moveTo(cx,cy-hh); g.lineTo(cx+hw,cy); g.lineTo(cx,cy+hh); g.lineTo(cx-hw,cy);
+            g.closePath(); g.clip();
+            if (SOIL_TEXTURES[i]!=null && !SOIL_TEXTURES[i].isError()) {
+                double W=SOIL_TEXTURES[i].getWidth(), H=SOIL_TEXTURES[i].getHeight();
+                g.setTransform(new Affine(hw/W, hw/H, 0, -hh/W, hh/H, cy));
+                g.drawImage(SOIL_TEXTURES[i], 0, 0, W, H);
+            }
+            SnapshotParameters sp = new SnapshotParameters();
+            sp.setFill(Color.TRANSPARENT);
+            soilCache[i] = tmp.snapshot(sp, null);
+        }
     }
 
-    private double toScreenX(int row, int col) {
-        return offsetX() + (col - row) * (tileW() / 2.0);
+    // ─── API publique ─────────────────────────────────────────────────────────
+    public void markDirty()             { dirtyFlag.set(true); }
+    public void requestRedraw()         { markDirty(); }
+    public void redraw()                { markDirty(); }
+    public void markDirty(int r, int c) { markDirty(); }
+    public void invalidateFull()        { rebuildSoilCache(); markDirty(); }
+    public void shutdown()              { worker.shutdownNow(); }
+
+    public void centreCamera() {
+        camX = 0;
+        camY = -(size * BASE_TILE_W / 4.0);
     }
 
-    private double toScreenY(int row, int col) {
-        return offsetY() + (col + row) * (tileH() / 2.0);
+    // ─── Boucle principale (FX thread) ────────────────────────────────────────
+    public void renderFrame() {
+        if (soilCacheTW < 0 && getWidth() > 0) rebuildSoilCache();
+        if (soilCacheTW < 0) return;
+
+        if (dirtyFlag.compareAndSet(true, false) && workerBusy.compareAndSet(false, true)) {
+            final double  sCamX = camX, sCamY = camY, sZoom = zoom;
+            final double  sW    = getWidth(), sH = getHeight();
+            final int     sHR   = hoverRow,  sHC = hoverCol;
+            final Image[] sSoil = soilCache.clone();
+            final List<AnimalSnapshot> sAnim = animalSnapshots;
+
+            worker.submit(() -> {
+                try {
+                    List<RenderCommand> cmds = buildFrame(
+                            sCamX, sCamY, sZoom, sW, sH, sHR, sHC, sSoil, sAnim);
+                    readyFrame.set(cmds);
+                    Platform.runLater(this::blitFrame);
+                } finally {
+                    workerBusy.set(false);
+                    if (dirtyFlag.get()) Platform.runLater(this::renderFrame);
+                }
+            });
+        }
     }
 
-    private double toScreenX(double row, double col) {
-        return offsetX() + (col - row) * (tileW() / 2.0);
+    // ─── Blit (FX thread) ─────────────────────────────────────────────────────
+    private void blitFrame() {
+        List<RenderCommand> cmds = readyFrame.getAndSet(null);
+        if (cmds == null) return;
+
+        GraphicsContext gc = getGraphicsContext2D();
+        gc.setFill(BG);
+        gc.fillRect(0, 0, getWidth(), getHeight());
+
+        Font lastFont = null;
+        for (RenderCommand cmd : cmds) {
+            switch (cmd.type) {
+                case DRAW_IMAGE ->
+                        gc.drawImage(cmd.image, cmd.imgX, cmd.imgY, cmd.imgW, cmd.imgH);
+                case FILL_POLYGON -> {
+                    gc.setFill(cmd.fillColor);
+                    gc.fillPolygon(cmd.polyXs, cmd.polyYs, 4);
+                }
+                case STROKE_POLYGON -> {
+                    gc.setStroke(cmd.strokeColor);
+                    gc.setLineWidth(cmd.strokeWidth);
+                    gc.strokePolygon(cmd.polyXs, cmd.polyYs, 4);
+                }
+                case FILL_TEXT -> {
+                    Font f = Font.font(cmd.fontSize);
+                    if (!f.equals(lastFont)) {
+                        gc.setFont(f);
+                        gc.setTextAlign(TextAlignment.CENTER);
+                        lastFont = f;
+                    }
+                    gc.setFill(cmd.fillColor);
+                    gc.fillText(cmd.text, cmd.textX, cmd.textY);
+                }
+            }
+        }
     }
 
-    private double toScreenY(double row, double col) {
-        return offsetY() + (col + row) * (tileH() / 2.0);
-    }
+    // ─── Worker : buildFrame ──────────────────────────────────────────────────
+    private List<RenderCommand> buildFrame(
+            double camX, double camY, double zoom,
+            double W, double H,
+            int hRow, int hCol,
+            Image[] soilCache,
+            List<AnimalSnapshot> animals) {
 
-    private int[] pickTile(double px, double py) {
-        for (int sum = 2 * size - 2; sum >= 0; sum--) {
-            for (int row = size - 1; row >= 0; row--) {
+        double tw = BASE_TILE_W * zoom;
+        double th = tw / 2.0;
+        double ox = W / 2.0 + camX;
+        double oy = H / 4.0 + camY;
+
+        List<RenderCommand> cmds = new ArrayList<>(1024);
+        int[] vb = visibleBounds(ox, oy, tw, th, W, H);
+
+        for (int sum = vb[0]+vb[2]; sum <= vb[1]+vb[3]; sum++)
+            for (int row = Math.max(vb[0],sum-vb[3]); row <= Math.min(vb[1],sum-vb[2]); row++) {
                 int col = sum - row;
-                if (col < 0 || col >= size) continue;
+                if (col >= 0 && col < size)
+                    buildTile(cmds, row, col, ox, oy, tw, th, hRow, hCol, soilCache);
+            }
 
-                if (isInsideTile(px, py, row, col)) {
-                    return new int[]{row, col};
+        buildAnimals(cmds, animals, ox, oy, tw, th);
+        return cmds;
+    }
+
+    private void buildTile(List<RenderCommand> cmds,
+                           int row, int col,
+                           double ox, double oy, double tw, double th,
+                           int hRow, int hCol,
+                           Image[] soilCache) {
+        Soil soil = farm[row][col];
+        boolean hov = (row==hRow && col==hCol);
+
+        double cx = ox + (col-row)*(tw/2.0);
+        double cy = oy + (col+row)*(th/2.0);
+        double hw = tw/2, hh = th/2;
+        double[] xs = {cx, cx+hw, cx, cx-hw};
+        double[] ys = {cy-hh, cy, cy+hh, cy};
+
+        int texIdx = soil.isField()
+                ? 3 + (Math.abs(Objects.hash(row,col,"field")) % 3)
+                : Math.abs(Objects.hash(row,col)) % 3;
+
+        Image soilImg = soilCache[texIdx];
+        if (soilImg != null)
+            cmds.add(RenderCommand.image(soilImg, cx-hw, cy-hh, tw, th));
+        else
+            cmds.add(RenderCommand.fillPoly(xs.clone(), ys.clone(), Color.SADDLEBROWN));
+
+        if (!soil.isOwned()) {
+            cmds.add(RenderCommand.fillPoly(xs.clone(), ys.clone(), UNOWNED_TINT));
+            if (hov) cmds.add(RenderCommand.fillPoly(xs.clone(), ys.clone(), HOVER_BUYABLE));
+        } else if (soil.isFree()) {
+            if (hov) cmds.add(RenderCommand.fillPoly(xs.clone(), ys.clone(), HOVER_FREE));
+        } else if (soil.crop.isFinished()) {
+            if (hov) cmds.add(RenderCommand.fillPoly(xs.clone(), ys.clone(), HOVER_READY));
+        } else {
+            cmds.add(RenderCommand.fillPoly(xs.clone(), ys.clone(), GROW_SHADOW));
+            if (hov) cmds.add(RenderCommand.fillPoly(xs.clone(), ys.clone(), HOVER_GROWING));
+        }
+
+        Color sc = !soil.isOwned()
+                ? (hov ? STROKE_HOVER : STROKE_UNOWNED)
+                : (hov ? STROKE_HOVER : STROKE_NORMAL);
+        double lw = hov ? (soil.isOwned()?4.0:3.0) : (soil.isOwned()?2.0:1.5);
+        cmds.add(RenderCommand.strokePoly(xs.clone(), ys.clone(), sc, lw));
+
+        if (!soil.isOwned() && hov) {
+            double fs = Math.max(8, tw*0.18);
+            cmds.add(RenderCommand.text(soil.getPurchasePrice()+" $", cx, cy+fs*0.4, fs, Color.YELLOW));
+        }
+
+        if (soil.isOwned() && !soil.isFree() && soil.crop != null) {
+            CropSprites sp = CROP_SPRITES_MAP.get(soil.crop.getType());
+            if (sp != null) {
+                Image img = soil.crop.isFinished() ? sp.ready : sp.growing;
+                if (img!=null && !img.isError()) {
+                    double iw=tw*0.8, ih=img.getHeight()*(iw/img.getWidth());
+                    cmds.add(RenderCommand.image(img, cx-iw/2.0, (cy+hh)-ih, iw, ih));
                 }
             }
+        }
+    }
+
+    private void buildAnimals(List<RenderCommand> cmds, List<AnimalSnapshot> animals,
+                              double ox, double oy, double tw, double th) {
+        if (ANIMAL_SPRITE == null) return;
+        for (AnimalSnapshot a : animals) {
+            double cx = ox+(a.col()-a.row())*(tw/2.0);
+            double cy = oy+(a.col()+a.row())*(th/2.0);
+            double w  = tw*0.5;
+            double h  = w*(ANIMAL_SPRITE.getHeight()/ANIMAL_SPRITE.getWidth());
+            double dy = cy-h+(th/4);
+            double imgX = a.facingRight() ? cx-w/2 : cx+w/2;
+            double imgW = a.facingRight() ? w : -w;
+            cmds.add(RenderCommand.image(ANIMAL_SPRITE, imgX, dy, imgW, h));
+            Image bubble = a.hungry()?BUBBLE_HUNGRY : a.hasProduct()?BUBBLE_READY : null;
+            if (bubble!=null) {
+                double bw=tw*0.6, bh=bw*(bubble.getHeight()/bubble.getWidth());
+                cmds.add(RenderCommand.image(bubble, cx-bw/2+60, dy-bh-5, bw, bh));
+            }
+        }
+    }
+
+    // ─── Frustum culling ─────────────────────────────────────────────────────
+    private int[] visibleBounds(double ox, double oy, double tw, double th, double W, double H) {
+        double minS=1e9,maxS=-1e9,minD=1e9,maxD=-1e9;
+        double[] px={0,W,0,W}, py={0,0,H,H};
+        for (int i=0;i<4;i++) {
+            double s=(py[i]-oy)*2.0/th, d=(px[i]-ox)*2.0/tw;
+            if(s<minS)minS=s; if(s>maxS)maxS=s;
+            if(d<minD)minD=d; if(d>maxD)maxD=d;
+        }
+        int m=2;
+        return new int[]{
+                Math.max(0,      (int)((minS-maxD)/2)-m),
+                Math.min(size-1, (int)((maxS-minD)/2)+m),
+                Math.max(0,      (int)((minS+minD)/2)-m),
+                Math.min(size-1, (int)((maxS+maxD)/2)+m)
+        };
+    }
+
+    // ─── Pick (FX thread) ─────────────────────────────────────────────────────
+    private int[] pickTile(double px, double py) {
+        double ox=originX(), oy=originY(), tw=tileW(), th=tileH();
+        int[] vb = visibleBounds(ox, oy, tw, th, getWidth(), getHeight());
+        for (int sum=vb[1]+vb[3]; sum>=vb[0]+vb[2]; sum--)
+            for (int row=Math.min(vb[1],sum-vb[2]); row>=Math.max(vb[0],sum-vb[3]); row--) {
+                int col=sum-row;
+                if (col>=0&&col<size&&isInsideTile(px,py,row,col,ox,oy,tw,th))
+                    return new int[]{row,col};
+            }
+        return null;
+    }
+
+    public int[] pickAnimalTile(double mx, double my) {
+        if (ANIMAL_SPRITE==null) return null;
+        double ox=originX(), oy=originY(), tw=tileW(), th=tileH();
+        for (AnimalSnapshot a : animalSnapshots) {
+            double cx=ox+(a.col()-a.row())*(tw/2);
+            double cy=oy+(a.col()+a.row())*(th/2);
+            double w=tw*0.5, h=w*(ANIMAL_SPRITE.getHeight()/ANIMAL_SPRITE.getWidth());
+            if (mx>=cx-w/2&&mx<=cx+w/2&&my>=cy-h&&my<=cy)
+                return new int[]{(int)a.row(),(int)a.col()};
         }
         return null;
     }
 
-
-    private boolean isInsideTile(double px, double py, int row, int col) {
-        double cx = toScreenX(row, col);
-        double cy = toScreenY(row, col);
-        double hw = tileW() / 2.0;
-        double hh = tileH() / 2.0;
-
-        double[] xs = {cx, cx + hw, cx, cx - hw};
-        double[] ys = {cy - hh, cy, cy + hh, cy};
-
-        return pointInPolygon(px, py, xs, ys);
+    private boolean isInsideTile(double px, double py, int row, int col,
+                                 double ox, double oy, double tw, double th) {
+        double cx=ox+(col-row)*(tw/2), cy=oy+(col+row)*(th/2);
+        double hw=tw/2, hh=th/2;
+        if (px<cx-hw||px>cx+hw||py<cy-hh||py>cy+hh) return false;
+        return pip(px,py,new double[]{cx,cx+hw,cx,cx-hw},new double[]{cy-hh,cy,cy+hh,cy});
     }
 
-    private boolean pointInPolygon(double px, double py, double[] xs, double[] ys) {
-        int n = xs.length;
-        boolean negative = false;
-        boolean positive = false;
-
-        for (int i = 0; i < n; i++) {
-            int j = (i + 1) % n;
-
-            double ax = xs[j] - xs[i];
-            double ay = ys[j] - ys[i];
-            double bx = px - xs[i];
-            double by = py - ys[i];
-
-            double resultatProduitVectoriel = ax * by - ay * bx;
-
-            if (resultatProduitVectoriel < 0) negative = true;
-            else if (resultatProduitVectoriel > 0) positive = true;
-
-            if (negative && positive) return false;
+    private boolean pip(double px, double py, double[] xs, double[] ys) {
+        boolean neg=false,pos=false;
+        for (int i=0;i<xs.length;i++){
+            int j=(i+1)%xs.length;
+            double c=(xs[j]-xs[i])*(py-ys[i])-(ys[j]-ys[i])*(px-xs[i]);
+            if(c<0)neg=true; else if(c>0)pos=true;
+            if(neg&&pos)return false;
         }
         return true;
     }
 
-    public void redraw() {
-        GraphicsContext gc = getGraphicsContext2D();
-
-        gc.setFill(Color.web("#5c8a3f"));
-        gc.fillRect(0, 0, getWidth(), getHeight());
-
-        for (int sum = 0; sum < 2 * size - 1; sum++) {
-            for (int row = 0; row < size; row++) {
-                int col = sum - row;
-                if (col < 0 || col >= size) continue;
-                drawTile(gc, row, col);
-            }
-        }
-
-        if (animals != null && ANIMAL_SPRITE != null) {
-            for (Animal animal : animals) {
-                double cx = toScreenX(animal.getRow(), animal.getCol());
-                double cy = toScreenY(animal.getRow(), animal.getCol());
-
-                double w = tileW() * 0.5;
-                double h = w * (ANIMAL_SPRITE.getHeight() / ANIMAL_SPRITE.getWidth());
-
-                gc.save();
-                if (!animal.isFacingRight()) {
-                    gc.translate(cx, cy);
-                    gc.scale(-1, 1);
-                    gc.translate(-cx, -cy);
-                }
-
-                double animalDrawY = cy - h + (tileH() / 4);
-                gc.drawImage(ANIMAL_SPRITE, cx - w / 2, animalDrawY, w, h);
-                gc.restore();
-            }
-        }
-
-        if (animals != null) {
-            for (Animal animal : animals) {
-
-                double cx = toScreenX(animal.getRow(), animal.getCol());
-                double cy = toScreenY(animal.getRow(), animal.getCol());
-                double w = tileW() * 0.5;
-                double h = w * (ANIMAL_SPRITE.getHeight() / ANIMAL_SPRITE.getWidth());
-                double animalDrawY = cy - h + (tileH() / 4);
-
-                if (animal.isHungry() && BUBBLE_HUNGRY != null) {
-                    double bubbleW = tileW() * 0.6;
-                    double bubbleH = bubbleW * (BUBBLE_HUNGRY.getHeight() / BUBBLE_HUNGRY.getWidth());
-                    double bubbleX = cx - (bubbleW / 2) + 60;
-                    double bubbleY = animalDrawY - bubbleH - 5;
-
-                    gc.drawImage(BUBBLE_HUNGRY, bubbleX, bubbleY, bubbleW, bubbleH);
-                }
-                else if (animal.hasProduct() && BUBBLE_READY != null) {
-                    double bubbleW = tileW() * 0.6;
-                    double bubbleH = bubbleW * (BUBBLE_READY.getHeight() / BUBBLE_READY.getWidth());
-                    double bubbleX = cx - (bubbleW / 2) + 60;
-                    double bubbleY = animalDrawY - bubbleH - 5;
-
-                    gc.drawImage(BUBBLE_READY, bubbleX, bubbleY, bubbleW, bubbleH);
-                }
-            }
-        }
-    }
-
-    private void drawTile(GraphicsContext gc, int row, int col) {
-        Soil soil = farm[row][col];
-        boolean hovered = (row == hoverRow && col == hoverCol);
-
-        double cx = toScreenX(row, col);
-        double cy = toScreenY(row, col);
-        double hw = tileW() / 2.0;
-        double hh = tileH() / 2.0;
-
-        double[] topXs = {cx, cx + hw, cx, cx - hw};
-        double[] topYs = {cy - hh, cy, cy + hh, cy};
-
-        buildCachedSoilTiles();
-
-        Image tile;
-        if (soil.isField()) {
-            int fieldIndex = 3 + (Math.abs(Objects.hash(row, col, "field")) % 3);
-            tile = cachedSoilTiles[fieldIndex];
-        } else {
-            int textureIndex = Math.abs(Objects.hash(row, col)) % 3;
-            tile = cachedSoilTiles[textureIndex];
-        }
-
-        gc.drawImage(tile, cx - hw, cy - hh, tileW(), tileH());
-
-        gc.save();
-        gc.beginPath();
-        gc.moveTo(cx, cy - hh);
-        gc.lineTo(cx + hw, cy);
-        gc.lineTo(cx, cy + hh);
-        gc.lineTo(cx - hw, cy);
-        gc.closePath();
-        gc.clip();
-
-        Color overlay;
-        String label;
-
-        if (soil.isFree()) {
-            overlay = hovered ? HOVER_FREE : Color.TRANSPARENT;
-            label = "";
-        } else if (soil.crop.isFinished()) {
-            overlay = hovered ? HOVER_READY : Color.TRANSPARENT;
-            label = soil.crop.getType();
-        } else {
-            overlay = hovered ? HOVER_GROWING : GROWING_SHADOW;
-            label = hovered ? "Pousse de " + soil.crop.getType() : "";
-        }
-
-        if (overlay != Color.TRANSPARENT) {
-            gc.setFill(overlay);
-            gc.fillPolygon(topXs, topYs, 4);
-        }
-
-        gc.restore();
-
-        gc.setStroke(hovered ? STROKE_HOVER : STROKE_NORMAL);
-        gc.setLineWidth(hovered ? 4.0 : 2.0);
-        gc.strokePolygon(topXs, topYs, 4);
-
-        boolean spriteDrawn = false;
-
-        if (!soil.isFree()) {
-            String cropType = soil.crop.getType();
-
-            CropSprites sprites = CROP_SPRITES_MAP.get(cropType);
-
-            if (sprites != null) {
-                Image currentSprite = soil.crop.isFinished() ? sprites.ready : sprites.growing;
-
-                if (currentSprite != null && !currentSprite.isError()) {
-                    double targetWidth = tileW() * 0.8;
-                    double scale = targetWidth / currentSprite.getWidth();
-                    double spriteW = currentSprite.getWidth() * scale;
-                    double spriteH = currentSprite.getHeight() * scale;
-
-                    double drawX = cx - (spriteW / 2.0);
-                    double yOffset = 0.0;
-                    double drawY = (cy + (tileH() / 2.0)) - spriteH + yOffset;
-
-                    gc.drawImage(currentSprite, drawX, drawY, spriteW, spriteH);
-                    spriteDrawn = true;
-                }
-            } else {
-                System.out.println("pas de sprite chargé pour cette plante");
-            }
-        }
-        if (!label.isEmpty() && !spriteDrawn) {
-            gc.setFill(Color.WHITE);
-            gc.setFont(Font.font(18));
-            gc.setTextAlign(TextAlignment.CENTER);
-            gc.fillText(label, cx, cy + 7);
-        }
-    }
-
-    private Animal getAnimalAt(double mouseX, double mouseY) {
-        if (animals != null) {
-            for (Animal animal : animals) {
-                double cx = toScreenX(animal.getRow(), animal.getCol());
-                double cy = toScreenY(animal.getRow(), animal.getCol());
-                double w = tileW() * 0.5;
-                double h = w * (ANIMAL_SPRITE.getHeight() / ANIMAL_SPRITE.getWidth());
-
-                if (mouseX >= cx - w/2 && mouseX <= cx + w/2 && mouseY >= cy - h && mouseY <= cy) {
-                    return animal;
-                }
-            }
-        }
-        return null;
+    private void setHover(int row, int col) {
+        if (row==hoverRow&&col==hoverCol) return;
+        hoverRow=row; hoverCol=col; markDirty();
     }
 }
